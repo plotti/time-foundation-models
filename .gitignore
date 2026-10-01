@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+
+# Data artifacts (downloaded / assembled)
+data/*.npz
+data/*.csv
+# the assembled benchmark dataset IS committed so the notebook's DATA_URL resolves
+data/*.parquet
+!data/zurich_bikes.parquet

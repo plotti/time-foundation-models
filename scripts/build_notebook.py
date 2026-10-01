@@ -165,6 +165,7 @@ The "ARIMA era". **Seasonal-Naive** (last week's same hour) is the floor every m
 beat. **AutoARIMA** gets the covariates as exogenous regressors (that's the *X* in SARIMAX);
 **AutoETS** is univariate exponential smoothing. Run via `statsforecast`.
 """)
+code("""!uv pip install -q --system statsforecast 2>/dev/null""")
 code("""from statsforecast import StatsForecast
 from statsforecast.models import SeasonalNaive, AutoARIMA, AutoETS
 
@@ -207,6 +208,7 @@ default. **LightGBM** on lag + calendar + weather features — the strong baseli
 foundation models must actually beat (the M5-winning recipe, and the tie-back to the
 tabular project).
 """)
+code("""!uv pip install -q --system prophet 2>/dev/null""")
 code("""from prophet import Prophet
 
 def prophet_fp(hist, fut_cov, H, quantiles):
@@ -227,6 +229,7 @@ def prophet_fp(hist, fut_cov, H, quantiles):
 RESULTS.append(evaluate("Prophet", prophet_fp, False))
 RESULTS.append(evaluate("Prophet", prophet_fp, True))""")
 
+code("""!uv pip install -q --system mlforecast lightgbm 2>/dev/null""")
 code("""from mlforecast import MLForecast
 from mlforecast.target_transforms import Differences
 import lightgbm as lgb
@@ -264,6 +267,10 @@ regressor; **Moirai** v1 natively. We run each with and without covariates where
 supported.
 """)
 code('''# --- Chronos-2 (Amazon) — native joint covariates ---
+try:
+    import chronos
+except ModuleNotFoundError:
+    import subprocess; subprocess.run(["uv","pip","install","-q","--system","chronos-forecasting"])
 try:
     from chronos import Chronos2Pipeline
     import torch

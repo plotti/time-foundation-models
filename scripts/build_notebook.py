@@ -31,8 +31,8 @@ Four model families:
 - **Intermediate:** **Prophet** (+ regressors), **LightGBM** on lag features — via `mlforecast`
 - **Foundation:** **Chronos-2**, **TabPFN-TS**, **TimesFM 2.5**, **Moirai**
 """)
-code("""!pip -q install statsforecast mlforecast utilsforecast prophet lightgbm \\
-    chronos-forecasting tabpfn-time-series timesfm "uni2ts" 2>/dev/null
+code("""!uv pip install -q --system statsforecast mlforecast utilsforecast prophet lightgbm \\
+    chronos-forecasting tabpfn-time-series "timesfm[xreg]" "jax[cpu]" uni2ts 2>/dev/null
 import torch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("torch", torch.__version__, "| device:", DEVICE)
@@ -170,16 +170,20 @@ from statsforecast.models import SeasonalNaive, AutoARIMA, AutoETS
 
 def sf_forecaster(model_ctor, with_x):
     def fp(hist, fut_cov, H, quantiles):
-        sdf = pd.DataFrame({"unique_id": "z", "ds": hist.index,
-                            "y": hist[TARGET].values})
-        levels = [80]  # P10/P90 band
+        use_x = with_x
+        sdf = pd.DataFrame({"unique_id": "z", "ds": hist.index, "y": hist[TARGET].values})
+        levels = [80]  # -> lo-80/hi-80 = P10/P90 band
         kw = {}
-        if with_x and fut_cov is not None:
-            for c in COVARIATES:
-                sdf[c] = hist[c].values
-            X_df = fut_cov.reset_index().rename(columns={"ds": "ds"})
-            X_df["unique_id"] = "z"
-            kw["X_df"] = X_df[["unique_id", "ds"] + COVARIATES]
+        if use_x and fut_cov is not None:
+            # drop covariates that are constant in this window (SARIMAX chokes on them)
+            active = [c for c in COVARIATES if hist[c].nunique() > 1]
+            if active:
+                for c in active:
+                    sdf[c] = hist[c].values
+                X_df = fut_cov.reset_index(); X_df["unique_id"] = "z"
+                kw["X_df"] = X_df[["unique_id", "ds"] + active]
+            else:
+                use_x = False
         sf = StatsForecast(models=[model_ctor], freq="h", n_jobs=1)
         fc = sf.forecast(df=sdf, h=H, level=levels, **kw)
         name = model_ctor.__class__.__name__
@@ -188,10 +192,13 @@ def sf_forecaster(model_ctor, with_x):
         return np.clip(np.column_stack([lo, p50, hi]), 0, None)
     return fp
 
+# ARIMA search space is capped so AutoARIMA doesn't take forever per window
+ARIMA = lambda: AutoARIMA(season_length=24, max_p=5, max_d=2, max_q=5,
+                          max_P=2, max_D=1, max_Q=2)
 RESULTS.append(evaluate("SeasonalNaive", sf_forecaster(SeasonalNaive(season_length=168), False), False))
 RESULTS.append(evaluate("AutoETS", sf_forecaster(AutoETS(season_length=24), False), False))
-RESULTS.append(evaluate("ARIMA", sf_forecaster(AutoARIMA(season_length=24), False), False))
-RESULTS.append(evaluate("ARIMA", sf_forecaster(AutoARIMA(season_length=24), True), True))""")
+RESULTS.append(evaluate("ARIMA", sf_forecaster(ARIMA(), False), False))
+RESULTS.append(evaluate("ARIMA", sf_forecaster(ARIMA(), True), True))""")
 
 md("""## 5 · Intermediate — Prophet & LightGBM
 
@@ -256,52 +263,86 @@ doc): **Chronos-2** and **TabPFN-TS** model covariates jointly; **TimesFM** via 
 regressor; **Moirai** v1 natively. We run each with and without covariates where it's
 supported.
 """)
-code("""# --- Chronos-2 (Amazon) — native joint covariates ---
+code('''# --- Chronos-2 (Amazon) — native joint covariates ---
 try:
     from chronos import Chronos2Pipeline
+    import torch
     _chronos = Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map=DEVICE)
     def chronos_fp_factory(with_x):
         def fp(hist, fut_cov, H, quantiles):
-            ctx = {"target": hist[TARGET].values.astype("float32")}
-            fut = None
+            target_vals = hist[TARGET].values.astype("float32")
             if with_x and fut_cov is not None:
+                # stack target + covariates as variates: (1, n_variates, context_len)
+                feats = [target_vals]
                 for c in COVARIATES:
-                    ctx[c] = hist[c].values.astype("float32")
-                fut = {c: fut_cov[c].values.astype("float32") for c in COVARIATES}
-            q = _chronos.predict_quantiles(context=ctx, prediction_length=H,
-                                           quantile_levels=quantiles,
-                                           future_covariates=fut)
-            return np.clip(np.asarray(q).reshape(H, len(quantiles)), 0, None)
+                    cov = np.concatenate([hist[c].values, fut_cov[c].values])
+                    feats.append(cov.astype("float32")[:len(target_vals)])
+                inp = torch.tensor(np.stack(feats, axis=0)).unsqueeze(0)
+            else:
+                inp = torch.tensor(target_vals).unsqueeze(0).unsqueeze(0)
+            res = _chronos.predict_quantiles(inputs=inp, prediction_length=H,
+                                             quantile_levels=quantiles)
+            if isinstance(res, (list, tuple)):
+                res = res[0]
+            res = res.cpu().numpy() if hasattr(res, "cpu") else np.asarray(res)
+            # (1, n_variates, H, n_quantiles) -> target variate 0
+            res = res[0, 0, :, :]
+            return np.clip(res, 0, None)
         return fp
     RESULTS.append(evaluate("Chronos-2", chronos_fp_factory(False), False))
     RESULTS.append(evaluate("Chronos-2", chronos_fp_factory(True), True))
 except Exception as e:
-    print("Chronos-2 skipped:", e)""")
+    print("Chronos-2 skipped:", e)''')
 
-code("""# --- TimesFM 2.5 (Google) — covariates via auxiliary regressor ---
+code('''# --- TimesFM 2.5 (Google) ---
+# API verified against timesfm 3.0.2 (which ships the 2.5 model under
+# timesfm.timesfm_2p5). Gotchas handled:
+#   * class lives in timesfm.timesfm_2p5.timesfm_2p5_torch, not top-level
+#   * quantiles tensor is (n, L, 10) = [mean, q10..q90] -> P10/P50/P90 = idx 1,5,9
+#   * with return_backcast=True (needed for covariates), forecast() PREPENDS the
+#     backcast, so L = context+H -> always slice the LAST H rows ([-H:])
+#   * covariates need `pip install timesfm[xreg]` + a working jax; the xreg path
+#     returns a POINT forecast, so we widen it with the univariate quantile spread.
+#   verified end-to-end on the real Zurich data (base MASE ~0.41).
 try:
+    import torch, numpy as np
+    from timesfm.timesfm_2p5.timesfm_2p5_torch import TimesFM_2p5_200M_torch
     import timesfm
-    _tfm = timesfm.TimesFm(hparams=timesfm.TimesFmHparams(backend=DEVICE,
-            per_core_batch_size=1, horizon_len=H),
-            checkpoint=timesfm.TimesFmCheckpoint(
-            huggingface_repo_id="google/timesfm-2.5-200m-pytorch"))
-    def timesfm_fp(hist, fut_cov, H, quantiles):
-        fdf = pd.DataFrame({"unique_id": "z", "ds": hist.index, "y": hist[TARGET].values})
-        if fut_cov is not None:
-            fc = _tfm.forecast_on_df(inputs=fdf, freq="h", value_name="y",
-                 dynamic_numerical_covariates={c: (hist[c].values, fut_cov[c].values)
-                                               for c in WEATHER})
-        else:
-            fc = _tfm.forecast_on_df(inputs=fdf, freq="h", value_name="y")
-        p50 = np.clip(fc["timesfm"].values[:H], 0, None)
-        # TimesFM quantile heads
-        lo = fc.get("timesfm-q-0.1", pd.Series(p50)).values[:H]
-        hi = fc.get("timesfm-q-0.9", pd.Series(p50)).values[:H]
-        return np.clip(np.column_stack([lo, p50, hi]), 0, None)
-    RESULTS.append(evaluate("TimesFM", timesfm_fp, False))
-    RESULTS.append(evaluate("TimesFM", timesfm_fp, True))
+    torch.set_float32_matmul_precision("high")
+    _tfm = TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
+    _tfm.compile(timesfm.ForecastConfig(
+        max_context=CONTEXT, max_horizon=H, normalize_inputs=True,
+        use_continuous_quantile_head=True, infer_is_positive=True,
+        fix_quantile_crossing=True, return_backcast=True))
+    Q_IDX = [1, 5, 9]  # q10, q50, q90 within the 10-column [mean,q10..q90] output
+
+    def timesfm_base(hist, fut_cov, H, quantiles):
+        ctx = hist[TARGET].values.astype("float32")
+        _, q = _tfm.forecast(horizon=H, inputs=[ctx])
+        return np.clip(q[0][-H:][:, Q_IDX], 0, None)      # last H rows -> (H, 3)
+
+    def timesfm_cov(hist, fut_cov, H, quantiles):
+        ctx = hist[TARGET].values.astype("float32")
+        # dynamic covariates must span context+horizon
+        dyn = {c: [np.concatenate([hist[c].values, fut_cov[c].values]).astype("float32")]
+               for c in WEATHER}
+        out, _ = _tfm.forecast_with_covariates(
+            inputs=[ctx], dynamic_numerical_covariates=dyn,
+            xreg_mode="timesfm + xreg")
+        p50 = np.clip(np.asarray(out[0])[-H:], 0, None)   # point forecast, last H
+        # borrow the univariate band width around the covariate-adjusted median
+        _, qu = _tfm.forecast(horizon=H, inputs=[ctx]); qu = qu[0][-H:]
+        lo_off = qu[:, 1] - qu[:, 5]
+        hi_off = qu[:, 9] - qu[:, 5]
+        return np.clip(np.column_stack([p50 + lo_off, p50, p50 + hi_off]), 0, None)
+
+    RESULTS.append(evaluate("TimesFM", timesfm_base, False))
+    try:
+        RESULTS.append(evaluate("TimesFM", timesfm_cov, True))
+    except Exception as e:
+        print("TimesFM covariate path skipped (need `pip install timesfm[xreg]` + jax):", e)
 except Exception as e:
-    print("TimesFM skipped:", e)""")
+    print("TimesFM skipped:", e)''')
 
 code("""# --- Moirai (Salesforce) — native any-variate covariates (v1) ---
 try:

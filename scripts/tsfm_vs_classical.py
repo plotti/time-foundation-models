@@ -30,7 +30,9 @@ Run on a GPU (Colab T4). TabPFN-TS needs a free Prior Labs token.
 # ## 1 · Setup
 # %%
 # !uv pip install -q --system statsforecast mlforecast utilsforecast prophet lightgbm \
-#     chronos-forecasting tabpfn-time-series tabpfn-client "timesfm[xreg]" "jax[cpu]" uni2ts
+#     chronos-forecasting tabpfn-time-series tabpfn-client "timesfm[xreg]" "jax[cpu]"
+# NOTE: Moirai (uni2ts) is intentionally NOT installed here — it pins torch 2.4.1 and
+# breaks Chronos-2 / TimesFM. It lives in its own notebook (moirai_only.ipynb).
 import os, numpy as np, pandas as pd
 import torch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -311,44 +313,11 @@ try:
 except Exception as e:
     print("TimesFM skipped:", e)
 
-# %%
-# --- Moirai (Salesforce) — GluonTS-based; native any-variate covariates ---
-# Real uni2ts API: build a wide gluonts PandasDataset, split into context/future,
-# construct MoiraiForecast with feat_dynamic_real_dim = #future-known covariates,
-# create_predictor().predict(), then read forecast.quantile(q).
-try:
-    from uni2ts.model.moirai import MoiraiForecast, MoiraiModule
-    from gluonts.dataset.pandas import PandasDataset
-    from gluonts.dataset.split import split
-    _moirai_mod = MoiraiModule.from_pretrained("Salesforce/moirai-1.1-R-small")
-
-    def moirai_fp_factory(with_x):
-        def fp(hist, fut_cov, H, quantiles):
-            feat_cols = COVARIATES if (with_x and fut_cov is not None) else []
-            # one wide frame: target + covariates over context+horizon; target NaN in horizon
-            idx = hist.index.append(fut_cov.index if fut_cov is not None
-                                    else pd.date_range(hist.index[-1], periods=H + 1, freq="h")[1:])
-            wide = pd.DataFrame(index=idx)
-            wide[TARGET] = np.concatenate([hist[TARGET].values, np.full(H, np.nan)])
-            for c in feat_cols:
-                wide[c] = np.concatenate([hist[c].values, fut_cov[c].values])
-            ds = PandasDataset(wide, target=TARGET,
-                               feat_dynamic_real=feat_cols or None, freq="h")
-            _, test_tmpl = split(ds, offset=-H)
-            test_data = test_tmpl.generate_instances(prediction_length=H)
-            model = MoiraiForecast(
-                module=_moirai_mod, prediction_length=H, context_length=len(hist),
-                patch_size="auto", num_samples=100, target_dim=1,
-                feat_dynamic_real_dim=len(feat_cols), past_feat_dynamic_real_dim=0)
-            predictor = model.create_predictor(batch_size=1)
-            fc = next(iter(predictor.predict(test_data.input)))
-            qs = np.column_stack([fc.quantile(q) for q in quantiles])
-            return np.clip(qs, 0, None)
-        return fp
-    RESULTS.append(evaluate("Moirai", moirai_fp_factory(False), False))
-    RESULTS.append(evaluate("Moirai", moirai_fp_factory(True), True))
-except Exception as e:
-    print("Moirai skipped:", e)
+# %% [markdown]
+# > **Moirai is in a separate notebook** (`moirai_only.ipynb`). Its `uni2ts` dependency
+# > pins **torch 2.4.1**, which is incompatible with the newer torch that Chronos-2 and
+# > TimesFM 2.5 need — installing it here silently breaks the other foundation models.
+# > Run that notebook on its own and fold its `RESULTS_JSON` into the table below.
 
 # %%
 # --- TabPFN-TS (Prior Labs) — known covariates, needs token ---

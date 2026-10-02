@@ -25,16 +25,27 @@ feature from the tabular project.)
 evaluation design in **[`research/RESEARCH.md`](research/RESEARCH.md)**.
 
 - `scripts/build_dataset.py` → `data/zurich_bikes.parquet` (43,762 hourly rows, 2019–2023) ✅
-- `scripts/build_notebook.py` → `notebooks/tsfm_vs_classical.ipynb` ✅
-  (run it on a **Colab T4 GPU**; the harness, rolling backtest, and metrics are verified).
+- `scripts/tsfm_vs_classical.py` → **source of truth** (runnable, jupytext `# %%` cells) ✅
+- `scripts/py_to_notebook.py` → `notebooks/tsfm_vs_classical.ipynb` (generated) ✅
 
-The notebook runs the full ladder through one rolling-origin backtest, each model **with and
-without covariates**, scored on point (MAE/MASE) **and** probabilistic (pinball/coverage)
-metrics, and prints a copy-paste results block + blog draft.
+Run the notebook on a **Colab T4 GPU**. It runs the full ladder through one rolling-origin
+backtest, each model **with and without covariates**, scored on point (MAE/MASE) **and**
+probabilistic (pinball/coverage) metrics, then prints a copy-paste results block + blog draft.
 
-> Note: the foundation-model cells and `statsforecast` need the fresh installs Colab
-> provides — a local run can hit a `statsmodels`/`statsforecast` version clash. The backtest
-> harness and metrics themselves are validated locally.
+### Verified locally (ran on the real data, clean venvs)
+
+| Model | base MASE | +cov MASE | status |
+|---|---|---|---|
+| SeasonalNaive | 0.349 | — | ✅ ran |
+| AutoETS | 0.914 | — | ✅ ran |
+| ARIMA/SARIMAX | 0.536 | 0.582 | ✅ ran |
+| LightGBM | 0.541 | **0.333** | ✅ ran (cov −38%) |
+| TimesFM 2.5 | ~0.41 | — | ✅ ran |
+| **TabPFN-TS** | 0.426 | **0.250** | ✅ ran (cov −41%) |
+| **Moirai** | 0.489 | 0.614 | ✅ ran (cov hurt) |
+| Chronos-2 | — | — | GPU-only, run on Colab |
+
+(Numbers are a few windows for verification, not the full 14-window benchmark.)
 
 **Recommended dataset:** EPF (Electricity Price Forecasting) — hourly day-ahead prices for
 5 European/US markets with *future-known* load & wind covariates. Clean target/covariate

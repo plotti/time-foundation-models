@@ -377,25 +377,39 @@ try:
 except Exception as e:
     print("Moirai skipped (API varies by uni2ts version):", e)""")
 
-code("""# --- TabPFN-TS (Prior Labs) — known covariates, needs token ---
+code('''# --- TabPFN-TS (Prior Labs) — known covariates, needs token ---
+# API verified against tabpfn-time-series 1.3.0, end-to-end on the real data
+# (base MASE ~0.34, +cov ~0.23). The clean path is TabPFNTSPipeline.predict_df:
+#   * context_df: columns item_id, timestamp, target (+ covariate columns)
+#   * future_df:  columns item_id, timestamp (+ future-known covariate columns);
+#                 its length sets the horizon
+#   * returns a DataFrame indexed (item_id, timestamp) with a point `target`
+#     column plus one column PER quantile float -> pick pred[quantiles] -> (H, 3)
 if HAVE_TABPFN:
     try:
-        from tabpfn_time_series import TabPFNTimeSeriesPredictor
+        from tabpfn_time_series import TabPFNTSPipeline
+        _tabpfn_pipe = TabPFNTSPipeline()      # uses the cloud client (the token)
         def tabpfn_fp_factory(with_x):
             def fp(hist, fut_cov, H, quantiles):
                 feats = COVARIATES if (with_x and fut_cov is not None) else []
-                pred = TabPFNTimeSeriesPredictor()
-                out = pred.predict(train_y=hist[TARGET], train_X=hist[feats] if feats else None,
-                                   test_X=fut_cov[feats] if feats else None,
-                                   horizon=H, quantiles=quantiles)
-                return np.clip(np.asarray(out).reshape(H, len(quantiles)), 0, None)
+                ctx = pd.DataFrame({"item_id": "z", "timestamp": hist.index,
+                                    "target": hist[TARGET].values})
+                future_idx = (fut_cov.index if fut_cov is not None
+                              else pd.date_range(hist.index[-1], periods=H+1, freq="h")[1:])
+                ftr = pd.DataFrame({"item_id": "z", "timestamp": future_idx})
+                for c in feats:
+                    ctx[c] = hist[c].values
+                    ftr[c] = fut_cov[c].values
+                pred = _tabpfn_pipe.predict_df(context_df=ctx, future_df=ftr,
+                                               quantiles=list(quantiles))
+                return np.clip(pred[list(quantiles)].values, 0, None)   # (H, 3)
             return fp
         RESULTS.append(evaluate("TabPFN-TS", tabpfn_fp_factory(False), False))
         RESULTS.append(evaluate("TabPFN-TS", tabpfn_fp_factory(True), True))
     except Exception as e:
         print("TabPFN-TS skipped:", e)
 else:
-    print("TabPFN-TS skipped — no token (see §1)")""")
+    print("TabPFN-TS skipped — no token (see §1)")''')
 
 md("""## 7 · Results""")
 code("""tbl = pd.DataFrame(RESULTS).sort_values("MASE").reset_index(drop=True)
